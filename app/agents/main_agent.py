@@ -1,20 +1,85 @@
+# from langchain_core.prompts import ChatPromptTemplate
+# from langchain.agents import AgentExecutor, create_tool_calling_agent
+# from langchain_core.runnables.history import RunnableWithMessageHistory
+# from langchain_community.chat_message_histories import ChatMessageHistory
+# from langchain_core.chat_history import BaseChatMessageHistory
+# from langchain_core.tools import Tool
+# from ..llm_model.llm_model import llm
+# from ..tools.fleet_tools import plan_route_to_csv
+# import json
+
+# # System prompt: tell the model to prefer the CSV tool when the user asks for data.
+# SYSTEM = (
+# "You are a helpful, concise assistant for a fleet simulator. "
+# "When the user asks to generate or update telemetry/CSV, "
+# "call the tool `plan_route_to_csv` with sensible defaults (6-hour duty) "
+# "unless the user provides specific values. "
+# "Return a short summary and the CSV path."
+# )
+
+# prompt = ChatPromptTemplate.from_messages([
+#     ("system", SYSTEM),
+#     ("placeholder", "{chat_history}"),
+#     ("user", "{input}"),
+#     ("placeholder", "{agent_scratchpad}")
+# ])
+
+# tools = [plan_route_to_csv]
+# agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
+# agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+
+# # Simple in-memory chat store
+# _store = {}
+
+# def _get_history(session_id: str) -> BaseChatMessageHistory:
+#     if session_id not in _store:
+#         _store[session_id] = ChatMessageHistory()
+#     return _store[session_id]
+
+# def run_general_chat_agent(user_input: str, session_id: str = "default"):
+#     with_history = RunnableWithMessageHistory(
+#         agent_executor,
+#         lambda: _get_history(session_id),
+#         input_messages_key="input",
+#         history_messages_key="chat_history",
+#     )
+#     result = with_history.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
+#     print(f"Agent result: {result}")
+#     # If the tool returned JSON, surface it nicely
+#     out = result.get("output") if isinstance(result, dict) else result
+#     # print(f"Agent output: {out}")
+#     try:
+#         parsed = json.loads(out) if isinstance(out, str) and out.strip().startswith("{") else None
+#         # print(f"Parsed tool result: {parsed}")
+#         return {"response": out, "tool_result": parsed}
+#     except Exception:
+#         return {"response": out, "tool_result": None}
+
+
+
+# app/agents/main_agent.py
+from __future__ import annotations
+
+import json
+from typing import Optional, Tuple
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.chat_history import BaseChatMessageHistory
+
 from langchain_core.tools import Tool
 from ..llm_model.llm_model import llm
 from ..tools.fleet_tools import plan_route_to_csv
-import json
 
-# System prompt: tell the model to prefer the CSV tool when the user asks for data.
+# System prompt: hard-nudge the LLM to actually CALL the tool.
 SYSTEM = (
-"You are a helpful, concise assistant for a fleet simulator. "
-"When the user asks to generate or update telemetry/CSV, "
-"call the tool `plan_route_to_csv` with sensible defaults (6-hour duty) "
-"unless the user provides specific values. "
-"Return a short summary and the CSV path."
+    "You are a helpful, concise assistant for a fleet simulator.\n"
+    "When the user asks to generate or update telemetry/CSV, you MUST call the tool `plan_route_to_csv` "
+    "with sensible defaults (6-hour duty) unless the user provides specific values.\n"
+    "After using the tool, briefly summarize and include the CSV path. "
+    "Avoid long prose; prefer the tool."
 )
 
 prompt = ChatPromptTemplate.from_messages([
@@ -26,7 +91,15 @@ prompt = ChatPromptTemplate.from_messages([
 
 tools = [plan_route_to_csv]
 agent = create_tool_calling_agent(llm=llm, tools=tools, prompt=prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True, handle_parsing_errors=True)
+
+# IMPORTANT: return_intermediate_steps=True to capture tool outputs
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=True,
+    handle_parsing_errors=True,
+    return_intermediate_steps=True,
+)
 
 # Simple in-memory chat store
 _store = {}
@@ -36,6 +109,36 @@ def _get_history(session_id: str) -> BaseChatMessageHistory:
         _store[session_id] = ChatMessageHistory()
     return _store[session_id]
 
+
+def _extract_tool_json(result_dict) -> Optional[dict]:
+    """
+    Pull the last `plan_route_to_csv` output from intermediate_steps and parse JSON.
+    Fallback: try to parse the final `output` string as JSON if present.
+    """
+    # 1) Look into intermediate_steps
+    steps = result_dict.get("intermediate_steps") or []
+    for action, output in reversed(steps):
+        try:
+            if getattr(action, "tool", "") == "plan_route_to_csv" and isinstance(output, str):
+                j = json.loads(output)
+                if isinstance(j, dict) and j.get("ok") is not None:
+                    return j
+        except Exception:
+            pass
+
+    # 2) Fallback: sometimes the final output is just the tool JSON string
+    final_out = result_dict.get("output")
+    if isinstance(final_out, str):
+        try:
+            j = json.loads(final_out)
+            if isinstance(j, dict) and j.get("ok") is not None:
+                return j
+        except Exception:
+            pass
+
+    return None
+
+
 def run_general_chat_agent(user_input: str, session_id: str = "default"):
     with_history = RunnableWithMessageHistory(
         agent_executor,
@@ -43,14 +146,15 @@ def run_general_chat_agent(user_input: str, session_id: str = "default"):
         input_messages_key="input",
         history_messages_key="chat_history",
     )
-    result = with_history.invoke({"input": user_input}, config={"configurable": {"session_id": session_id}})
-    print(f"Agent result: {result}")
-    # If the tool returned JSON, surface it nicely
-    out = result.get("output") if isinstance(result, dict) else result
-    # print(f"Agent output: {out}")
-    try:
-        parsed = json.loads(out) if isinstance(out, str) and out.strip().startswith("{") else None
-        # print(f"Parsed tool result: {parsed}")
-        return {"response": out, "tool_result": parsed}
-    except Exception:
-        return {"response": out, "tool_result": None}
+    result = with_history.invoke(
+        {"input": user_input},
+        config={"configurable": {"session_id": session_id}},
+    )
+
+    # Final text to show the user
+    final_text = result.get("output") if isinstance(result, dict) else result
+
+    # Structured tool output (JSON) for the UI
+    tool_json = _extract_tool_json(result if isinstance(result, dict) else {})
+
+    return {"response": final_text, "tool_result": tool_json}
